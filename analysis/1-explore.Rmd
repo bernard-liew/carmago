@@ -1,0 +1,597 @@
+---
+title: "1-explore"
+author: "Bernard"
+date: "2021-11-18"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+# Load
+
+```{r}
+
+reticulate::use_condaenv("tf-gpu")
+tsai <- reticulate::import("tsai.all")
+library (reticulate)
+
+library (tidyverse)
+library (rmatio)
+
+# modelling
+library (refund)
+library (keras)
+library(tensorflow)
+
+# image
+library (imager)
+library(knitr)
+
+library (fastai)
+```
+
+
+# Custom CNN block
+
+```{r}
+# Deep learning helpers
+
+cnn_block <- function(filters, kernel_size, pool_size, rate, input_shape = NULL){
+  function(x){
+    x %>%
+      layer_conv_2d(filters, kernel_size, padding="same", input_shape = input_shape) %>%
+      layer_activation(activation = "relu") %>%
+      layer_batch_normalization() %>%
+      layer_max_pooling_2d(pool_size = pool_size) %>%
+      layer_dropout(rate = rate)
+  }
+}
+```
+
+# Performance metrics for time series
+
+```{r}
+# measures defined in Ren et al. 2008
+# with equidistant grid 
+
+integrate_fun <- function(X, 
+                          n = nrow(X),
+                          nxgrid = ncol(X), 
+                          xind = matrix(as.vector(1:ncol(X)), 
+                                        nrow=nrow(X), 
+                                        ncol=nxgrid, 
+                                        byrow=T),
+                          integration = "simpson")
+{
+  
+  # copied from refund:::pffr
+  # credits to Fabian Scheipl
+  L <- switch(integration,
+              "simpson" = {
+                # \int^b_a f(t) dt = (b-a)/gridlength/3 * [f(a) + 4*f(t_1) + 2*f(t_2) + 4*f(t_3) +
+                # 2*f(t_3) +...+ f(b)]
+                ((xind[,nxgrid]-xind[,1])/nxgrid)/3 *
+                  matrix(c(1, rep(c(4, 2), length=nxgrid-2), 1), nrow=n, ncol=nxgrid, byrow=T)
+              },
+              "trapezoidal" = {
+                # \int^b_a f(t) dt = .5* sum_i (t_i - t_{i-1}) f(t_i) + f(t_{i-1}) =
+                #	(t_2 - t_1)/2 * f(a=t_1) + sum^{nx-1}_{i=2} ((t_i - t_i-1)/2 + (t_i+1 - t_i)/2) * f(t_i) + 
+                # ... +
+                #			+ (t_nx - t_{nx-1})/2 * f(b=t_n)
+                diffs <- t(apply(xind, 1, diff))
+                .5 * cbind(diffs[,1],
+                           t(apply(diffs, 1, filter, filter=c(1,1)))[,-(nxgrid-1)],
+                           diffs[,(nxgrid-1)])
+              },
+              "riemann" = {
+                # simple quadrature rule:
+                # \int^b_a f(t) dt = sum_i (t_i-t_{i-1})*(f(t_i))
+                diffs <- t(apply(xind, 1, diff))
+                #assume delta(t_0=a, t_1) = avg. delta
+                cbind(rep(mean(diffs),n), diffs)
+              }
+  )
+  
+  apply(L*X,1,sum)
+  
+}
+
+RMSE <- function(actual_mat, pred_mat, time_diff = ncol(actual_mat)-1, ...)
+{
+  
+  sqrt(integrate_fun((actual_mat - pred_mat)^2, ...)/time_diff)
+  
+}
+
+relRMSE <- function(actual_mat, pred_mat, ...)
+{
+  
+  nom <- RMSE(actual_mat, pred_mat, ...)
+  denom <- 0.5 * (apply(actual_mat, 1, function(x) diff(range(x))) + 
+                    apply(pred_mat, 1, function(x) diff(range(x))))
+  return(nom/denom)
+  
+}
+
+cor_fun <- function(actual_mat, pred_mat)
+{
+  
+  sapply(1:nrow(actual_mat), function(i) cor(actual_mat[i,], pred_mat[i,])) 
+  
+}
+
+all_measures <- function(actual_mat, pred_mat, ...)
+{
+  
+  data.frame(RMSE = RMSE(actual_mat, pred_mat, ...),
+             relRMSE = relRMSE(actual_mat, pred_mat, ...),
+             cor = cor_fun(actual_mat, pred_mat))
+  
+}
+```
+
+
+
+# Import
+
+```{r}
+df <- read.mat("../../mocap_database/data_Zainab/Camargo_study/Filtered & unfiltered strides/unfiltered_all_data.mat")
+
+x <- df$inputs
+y <- df$outputs
+
+out_ind <- 1
+```
+
+# Tidy
+
+## 4D array
+
+Create four dimensional array for image based deep learning
+
+```{r}
+
+# NUmber of rows
+obs <- dim (x[[1]][[1]][[1]])[[1]]
+
+x_array_4d <- array (NA, 
+                  dim = c(obs, 
+                          101, # time points in gait
+                          8, # number of variables
+                          3)) # axis, x, y, z
+
+for (n in 1:3) {
+  
+  for (m in 1:8) {
+    
+    x_array_4d[, , m, n] <- x[[n]][[m]][[1]]
+  }
+}
+
+y_array <- array (NA, 
+                  dim = c(obs, 101, 5))
+
+for (n in 1:5) {
+  
+    y_array[, , n] <- y[[n]][[1]]
+}
+
+```
+
+## 3D array
+
+Create three dimensional array for image based deep learning
+
+```{r}
+x_array_3d <- array (NA, 
+                  dim = c(obs, 101, 24))
+
+x_array_3d[, , 1:8] <- x_array_4d [, , , 1]
+x_array_3d[, , 9:16] <- x_array_4d[, , , 2]
+x_array_3d[, , 17:24] <- x_array_4d [, , , 3]
+
+x_array_3d_tsai <- aperm(x_array_3d, perm = c(1, 3, 2))
+```
+
+
+## Outcome
+
+```{r}
+y_array <- y_array[, , out_ind]
+```
+
+# Missing
+
+```{r}
+# Old code where missing was present
+# miss <- apply (y_array[, , out_ind], 2, is.na)
+# miss <- apply (miss, 1, sum)
+# 
+# miss_ind <- miss == 0
+# 
+# x_array <- x_array2[miss_ind, , ]
+# y_array <- y_array[miss_ind, , out_ind]
+```
+
+
+# Split
+
+## Generate split indices
+
+```{r}
+## 80% train, 10% test, 10% validate
+smp_size <- floor(0.80 * obs )
+val_size <- floor(0.10 * smp_size)
+
+
+set.seed(123)
+train_ind <- sample(seq_len(obs), size = smp_size)
+test_ind <- setdiff (seq_len(obs), train_ind)
+val_ind <- sample(train_ind, size = val_size)
+train_ind <- setdiff (train_ind, val_ind)
+
+# Check
+length (train_ind) + length (val_ind) + length (test_ind) == obs
+
+
+```
+
+
+
+# Deep learning models
+
+## Python tsai
+
+### Set up data
+
+```{r}
+x_train <- x_array_3d_tsai [train_ind, , ]
+y_train <- y_array [train_ind, ]
+
+x_val <- x_array_3d_tsai [val_ind, , ]
+y_val <- y_array [val_ind, ]
+
+x_test <- x_array_3d_tsai [test_ind, , ]
+y_test <- y_array [test_ind, ]
+
+```
+
+### Train
+
+#### Trial one algorithm
+
+```{python}
+from tsai.all import *
+import numpy as np
+
+
+x_train = r.x_train
+x_val = r.x_val
+y_train = r.y_train
+y_val = r.y_val
+x_test = r.x_test
+y_test = r.y_test
+
+
+X, y, splits = combine_split_data([x_train, x_val], [y_train, y_val])
+
+tfms  = [None, [TSRegression()]]
+
+dls = get_ts_dls(X, y, splits=splits, tfms=tfms, bs=128)
+
+learn = ts_learner(dls, arch=InceptionTimePlus, metrics=[mae, mse])
+learn.lr_find()
+learn.recorder.plot ()
+learn.fit_one_cycle(10, lr_max=slice(1e-5,1e-1))
+
+probas, _, preds = learn.get_X_preds(X = x_test)
+preds = np.asarray (preds)
+
+
+```
+
+#### Test
+
+```{r}
+y_pred = py$preds
+all_measures (actual_mat = y_test,
+              pred_mat = y_pred) %>%
+  apply (2, mean)
+```
+
+#### Loop all algorithms
+
+```{python}
+archs = [(FCN, {}), (ResNet, {}), (xresnet1d34, {}), (ResCNN, {}), 
+         (LSTM, {'n_layers':1, 'bidirectional': False}), (LSTM, {'n_layers':2, 'bidirectional': False}), (LSTM, {'n_layers':3, 'bidirectional': False}), 
+         (LSTM, {'n_layers':1, 'bidirectional': True}), (LSTM, {'n_layers':2, 'bidirectional': True}), (LSTM, {'n_layers':3, 'bidirectional': True}),
+         (LSTM_FCN, {}), (LSTM_FCN, {'shuffle': False}), (InceptionTime, {}), (XceptionTime, {}), (OmniScaleCNN, {}), (mWDN, {'levels': 4})]
+
+results = pd.DataFrame(columns=['arch', 'hyperparams', 'total params', 'train loss', 'valid loss', 'accuracy', 'time'])
+for i, (arch, k) in enumerate(archs):
+    model = create_model(arch, dls=dls, **k)
+    print(model.__class__.__name__)
+    learn = Learner(dls, model,  metrics=[mae, mse])
+    start = time.time()
+    learn.fit_one_cycle(100, 1e-3)
+    elapsed = time.time() - start
+    vals = learn.recorder.values[-1]
+    results.loc[i] = [arch.__name__, k, total_params(model)[0], vals[0], vals[1], vals[2], int(elapsed)]
+    results.sort_values(by='mse', ascending=False, ignore_index=True, inplace=True)
+    clear_output()
+    display(results)
+```
+
+#### Test
+
+```{r}
+y_pred = py$preds
+all_measures (actual_mat = y_test,
+              pred_mat = y_pred) %>%
+  apply (2, mean)
+```
+
+## 3D covnets
+
+### Set up data
+
+```{r}
+x_train <- x_array_4d [train_ind, , ,]
+
+x_val <- x_array_4d [val_ind, , ,]
+
+x_test <- x_array_4d [test_ind, , ,]
+
+```
+
+### Train
+
+```{r}
+
+cnn1 <- cnn_block(filters = 32, kernel_size = c(2,2), pool_size = c(2,2), rate = 0.25,
+                  input_shape = c(101, 8, 3))
+cnn2 <- cnn_block(filters = 64, kernel_size = c(2,2), pool_size = c(2,2), rate = 0.25)
+cnn3 <- cnn_block(filters = 128, kernel_size = c(2,2), pool_size = c(2,2), rate = 0.25)
+
+# Create model --------------------------------------------------------------
+
+model <- keras_model_sequential() %>%
+  cnn1() %>%
+  cnn2() %>%
+  cnn3() %>%
+  #cnn4() %>%
+  # branch end
+  layer_flatten() %>%
+  layer_dense(256) %>%
+  layer_activation(activation = "relu") %>%
+  layer_batch_normalization() %>%
+  layer_dropout(rate = 0.5) %>%
+  layer_dense(101)
+
+
+model %>% compile(
+  optimizer = "rmsprop",
+  #optimizer = optimizer_adam(lr = 0.0001),
+  loss = "mse",
+  metrics = c("mae")
+)
+
+
+history <- model %>% fit(
+  x_train, 
+  y_train,
+  epochs = 50,
+  batch_size = 16,
+  validation_data = list(x_val, y_val),
+  callbacks =   list(
+    callback_learning_rate_scheduler(
+      tf$keras$experimental$CosineDecayRestarts(.02, 10, t_mul = 2, m_mul = .7)
+    ),
+    callback_early_stopping(patience = 5, mode = "auto", restore_best_weights = TRUE
+    )
+  )
+)
+
+```
+
+### Test
+
+```{r}
+y_pred <- model %>% 
+  predict(x_test)
+
+
+all_measures (actual_mat = y_test,
+              pred_mat = y_pred) %>%
+  apply (2, mean)
+```
+
+
+## 1D convnet
+
+### Set up data
+
+```{r}
+x_train <- x_array_3d [train_ind, ,]
+
+x_val <- x_array_3d  [val_ind, ,]
+
+x_test <- x_array_3d [test_ind, ,]
+
+```
+
+### Train
+
+
+```{r}
+
+# Create model --------------------------------------------------------------
+
+model <- keras_model_sequential() 
+model %>% 
+  layer_conv_1d(filters=32, kernel_size=7,  activation = "relu",  input_shape=c(101, 24)) %>%
+  layer_batch_normalization() %>%
+  layer_activation_relu() %>%
+  layer_conv_1d(filters=64, kernel_size=3,  activation = "relu") %>%
+  layer_batch_normalization() %>%
+  layer_activation_relu() %>%
+  layer_conv_1d(filters=128, kernel_size=3,  activation = "relu") %>%
+  layer_batch_normalization() %>%
+  layer_activation_relu() %>%
+  layer_flatten() %>% 
+  layer_dense(units = 256, activation = 'relu') %>%
+  layer_batch_normalization() %>%
+  layer_dropout(rate = 0.5) %>%
+  layer_dense(101)
+
+
+model %>% compile(
+  optimizer = "rmsprop",
+  #optimizer = optimizer_adam(lr = 0.0001),
+  loss = "mse",
+  metrics = c("mae")
+)
+
+
+history <- model %>% fit(
+  x_train, y_train,
+  epochs = 50,
+  batch_size = 16,
+  validation_data = list(x_val, y_val),
+  callbacks =   list(
+    callback_learning_rate_scheduler(
+      tf$keras$experimental$CosineDecayRestarts(.02, 10, t_mul = 2, m_mul = .7)
+    ),
+    callback_early_stopping(patience = 5, mode = "auto", restore_best_weights = TRUE
+    )
+  )
+)
+
+```
+
+### Test
+
+```{r}
+y_pred <- model %>% 
+  predict(x_test)
+
+
+all_measures (actual_mat = y_test,
+              pred_mat = y_pred) %>%
+  apply (2, mean)
+```
+
+## InceptionTime
+
+Custom inception time
+
+
+### Train
+
+```{r}
+
+inceptionNet <- import_from_path("inceptionnet", path = "code/")
+mod <- inceptionNet$Classifier_INCEPTION(output_directory = "output/inception/",
+                                         input_shape = dim(x_array2)[-1],
+                                         c_out = 101,
+                                         verbose = TRUE,
+                                         depth = 3L,
+                                         nb_filters = 8L,
+                                         batch_size = 128L,
+                                         lr = 0.00001,
+                                         patience = 5,
+                                         nb_epochs = 750L)
+
+y_pred_in <- mod$fit(x_train = x_train,
+                     y_train = y_train,
+                     x_val = x_val,
+                     y_val = y_val,
+                     y_true = y_test,
+                     nb_epochs = 750L,
+                     batch_size = 128L)
+
+y_pred <- mod$predict(x_test = x_test,
+                      y_true = y_test,
+                      x_train = x_train,
+                      y_train = y_train,
+                      y_test = y_val)
+
+all_measures (actual_mat = y_test,
+              pred_mat = y_pred) %>%
+  apply (2, mean)
+```
+
+### Test
+
+```{r}
+
+y_pred <- mod$predict(x_test = x_test,
+                      y_true = y_test,
+                      x_train = x_train,
+                      y_train = y_train,
+                      y_test = y_val)
+
+all_measures (actual_mat = y_test,
+              pred_mat = y_pred) %>%
+  apply (2, mean)
+```
+
+## LTSM
+
+
+### Train
+
+
+```{r}
+
+model <- keras_model_sequential() %>%
+  layer_conv_1d(filters=32, kernel_size=7,  activation = "relu",  input_shape=c(101, 24)) %>%
+   layer_max_pooling_1d(4) %>%
+  layer_dense(units = 256, activation = 'relu') %>%
+  layer_lstm(64) %>%
+  layer_activation_relu() %>%
+  layer_flatten() %>% 
+  layer_dense(units = 256, activation = 'relu') %>%
+  layer_batch_normalization() %>%
+  layer_dropout(rate = 0.5) %>%
+  layer_dense(101)
+
+
+model %>% compile(
+  optimizer = "rmsprop",
+  #optimizer = optimizer_adam(lr = 0.0001),
+  loss = "mse",
+  metrics = c("mae")
+)
+
+
+history <- model %>% fit(
+  x_train, y_train,
+  epochs = 50,
+  batch_size = 16,
+  validation_data = list(x_val, y_val),
+  callbacks =   list(
+    callback_learning_rate_scheduler(
+      tf$keras$experimental$CosineDecayRestarts(.02, 10, t_mul = 2, m_mul = .7)
+    ),
+    callback_early_stopping(patience = 5, mode = "auto", restore_best_weights = TRUE
+    )
+  )
+)
+
+
+```
+
+### Test
+
+```{r}
+y_pred <- model %>% 
+  predict(x_test)
+
+
+all_measures (actual_mat = y_test,
+              pred_mat = y_pred) %>%
+  apply (2, mean)
+```
+
+
