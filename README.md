@@ -6,5 +6,7 @@ A [workflowr][] project.
 
 
 Main code is in analysis/1-explore.Rmd
+
 Helper code is in code/ folder
+
 Data is in shared box folder
