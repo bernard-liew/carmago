@@ -17,7 +17,6 @@ on_server <- FALSE
 path_to_repos <- "~/NSL/"
 load_all(paste0(path_to_repos, "deepregression"))
 load_all(paste0(path_to_repos, "funnel"))
-devtools::load_all("~/NSL/deepoptim")
 
 ### Load data and split in train / test  --------------------------------------
 data_list <- readRDS("data/filtered_LiveEditor_all_data_v2_list.RDS")
@@ -179,7 +178,6 @@ mod <- funnel(y = train_y,
               time_variable_outcome = train$cycle,
               name_outcome_time = "cycle", 
               name_feature_time = "cycle",
-              optimizer = optimizer_sgd(lr = 0.01),
               monitor_metrics = list("mse"),
               fun_options = fun_controls(
                 k_t = 20,
@@ -215,13 +213,16 @@ prediction_neural_structured <- mod %>% predict(test)
 # # compare
 # par(mfrow=c(1,2))
 # matplot(t(test_y), type="l")
-# matplot(t(pe[[2]]), type="l", add=TRUE, col="red", lwd=2)
+# matplot(t(pe[[2]]+pe[[1]][[1]]), type="l", add=TRUE, col="red", lwd=2)
 # matplot(t(prediction_neural_structured), type="l")
-# matplot(t(pe[[2]]), type="l", add=TRUE, col="red", lwd=2)
+# matplot(t(pe[[2]]+pe[[1]][[1]]), type="l", add=TRUE, col="red", lwd=2)
+# # plot two examplary partial effects
+# matplot(t(pe[[2+12]]), type="l", main = predictor_names[12])
+# matplot(t(pe[[2+17]]), type="l", main = predictor_names[17])
 
-# par(mfrow=c(1,1))
-# matplot(t(test_y), type="l")
-# matplot(t(prediction_neural_structured), type="l", add=T, col="red", lwd=2)
+# pdf(file = "effect_surfaces.pdf")
+# mod %>% plot(which=2:25, main_multiple=predictor_names)
+# dev.off()
 
 saveRDS(prediction_neural_structured, file=paste0("output/prediction_", 
                                                   resp, "_neural_structured.RDS"))
@@ -255,7 +256,6 @@ mod <- funnel(y = train_y,
               time_variable_outcome = train$cycle,
               name_outcome_time = "cycle", 
               name_feature_time = "cycle",
-              # optimizer = optimizer_sgd(lr = 0.1),
               monitor_metrics = list("mse"),
               fun_options = fun_controls(
                 k_t = 20,
@@ -264,7 +264,6 @@ mod <- funnel(y = train_y,
                 df_s = 7,
                 intercept_k = 20
               )
-              # model_fun = build_bcdKeras("cyclic") 
 )
 
 if(!file.exists(paste0("models/weights_semistructured_",resp,".hdf5"))){
@@ -293,6 +292,21 @@ prediction_neural_semistructured <- mod %>% predict(test)
 # par(mfrow=c(1,2))
 # matplot(t(test_y), type="l")
 # matplot(t(prediction_neural_semistructured), type="l")
+
+saveRDS(prediction_neural_semistructured, file=paste0("output/prediction_", 
+                                                  resp, "_neural_semistructured.RDS"))
+
+test$train_x_mts_format <- I(test_x_mts_format*0)
+prediction_neural_semistructured_wo_unstr <- mod %>% predict(test)
+
+# relative MSE -> gives info about explained variance
+# (mean(c(test_y^2)) - mean(c((test_y - prediction_neural_semistructured)^2))) / 
+#   mean(c(test_y^2)) # = 0.9905672
+# (mean(c(test_y^2)) - mean(c((test_y - prediction_neural_semistructured_wo_unstr)^2))) / 
+#   mean(c(test_y^2)) # = 0.5855157
+
+
+rm(mod, prediction_neural_semistructured); gc()
 
 
 # }
